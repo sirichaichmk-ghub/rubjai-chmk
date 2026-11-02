@@ -414,7 +414,7 @@
  * - ถ้าเปิดแอปผ่านลิงก์ /exec โดยตรง ไม่ต้องใส่ (ใช้ google.script.run อัตโนมัติ)
  * - ถ้าวางไฟล์นี้บน GitHub Pages ต้องใส่ลิงก์ /exec ตรงนี้ */
 var API_URL = 'https://script.google.com/macros/s/AKfycbyc7kcSNMrcbyWec81A5PKhkLf38bOmxAiYIatgmNgI1t0RAu7sSLAASlOdk0yleCUn3g/exec';
-var APP_VERSION = 2;
+var APP_VERSION = 3;
 </script>
 
 <script>
@@ -459,8 +459,9 @@ var Parser = (function () {
     'ครึ่ง\\s*' + U,                              // 6     "ครึ่งกิโล"
     U + '\\s*ครึ่ง',                              // 7     "กิโลครึ่ง"
     NUM + '\\s*บาท',                              // 8     เงิน: "120 บาท"
-    NUM,                                          // 9     ตัวเลขเปล่า
-    '(ขาย(?:ได้|ไป)?|ซื้อ(?:มา)?|จ่าย)'           // 10    ประเภท
+    '(\\d+(?:\\.\\d+)?x\\d+(?:\\.\\d+)?(?:\\s*นิ้ว)?)', // 9  ขนาด: "ถุงร้อน 6x9" (เป็นส่วนของชื่อ)
+    NUM,                                          // 10    ตัวเลขเปล่า
+    '(ขาย(?:ได้|ไป)?|ซื้อ(?:มา)?|จ่าย)'           // 11    ประเภท
   ].map(function (s) { return '(?:' + s + ')'; }).join('|'), 'g');
 
   var LEAD = ['แล้วก็', 'และก็', 'แล้ว', 'และ', 'อีก', 'ราคา', 'เป็นเงิน', 'จำนวน', 'ทั้งหมด'];
@@ -501,6 +502,11 @@ var Parser = (function () {
       return /\d/.test(str.charAt(i - 1)) && /\d{3}/.test(str.substr(i + 1, 3)) ? '' : ' ';
     });
     s = s.replace(/฿/g, ' บาท ').replace(/(\d)\s*บ\./g, '$1 บาท ').replace(/KG|Kg/g, 'kg');
+    // ขนาดแพคเกจจิ้ง: "6 คูณ 9", "หกคูณเก้า", "6*9" → "6x9"
+    s = s.replace(new RegExp('((?:' + WORD_ALT + ')+)\\s*คูณ\\s*((?:' + WORD_ALT + ')+)', 'g'), function (m, a, b) {
+      return ' ' + wordsToNumber(a) + 'x' + wordsToNumber(b) + ' ';
+    });
+    s = s.replace(/(\d+(?:\.\d+)?)\s*(?:x|X|×|\*|คูณ)\s*(\d+(?:\.\d+)?)/g, '$1x$2');
     // "กิโลนึง" "ถุงหนึ่ง" = 1 หน่วย
     s = s.replace(new RegExp(U + '\\s*(?:หนึ่ง|นึง)', 'g'), ' 1 $1 ');
     // ตัวเลขคำไทย — แปลงเฉพาะเมื่ออยู่หน้าหน่วย/บาท/ละ หรือหลัง "ละ" (กัน "หมูสามชั้น", "พันธุ์")
@@ -549,8 +555,9 @@ var Parser = (function () {
       else if (m[6] != null) toks.push({ k: 'QTY', qty: 0.5, unit: UNIT_MAP[m[6]] });
       else if (m[7] != null) toks.push({ k: 'QTY', qty: 1.5, unit: UNIT_MAP[m[7]] });
       else if (m[8] != null) toks.push({ k: 'MONEY', n: +m[8] });
-      else if (m[9] != null) toks.push({ k: 'NUM', n: +m[9] });
-      else if (m[10] != null) toks.push({ k: 'TYPE', type: m[10].indexOf('ขาย') === 0 ? 'ขาย' : 'ซื้อ' });
+      else if (m[9] != null) toks.push({ k: 'WORD', text: ' ' + m[9] + ' ' });
+      else if (m[10] != null) toks.push({ k: 'NUM', n: +m[10] });
+      else if (m[11] != null) toks.push({ k: 'TYPE', type: m[11].indexOf('ขาย') === 0 ? 'ขาย' : 'ซื้อ' });
       last = TOKEN_RE.lastIndex;
     }
     if (last < s.length) toks.push({ k: 'WORD', text: s.slice(last) });
@@ -661,13 +668,57 @@ var Matcher = (function () {
     return n ? 1 - lev(a, b) / n : 0;
   }
 
-  /** catalog: [{name, aliases[], unit}], products: ชื่อที่เคยบันทึก */
-  function build(catalog, products) {
-    var idx = { exact: {}, alias: {}, aliasSound: {}, targets: [] };
+  /**
+   * พจนานุกรมศัพท์ประจำร้าน (ผลไม้ ของแปรรูป เครื่องปรุง แพคเกจจิ้ง)
+   * ใช้ "ถาม" เท่านั้น ไม่แก้เอง — คำที่แก้อัตโนมัติต้องอยู่ในแท็บคลังสินค้าหรือเคยบันทึกแล้ว
+   * เพิ่มคำได้: คั่นด้วยช่องว่าง
+   */
+  var DICT = [
+    // ผลไม้สด
+    'มะม่วง มะม่วงน้ำดอกไม้ มะม่วงเขียวเสวย มะม่วงอกร่อง มะม่วงมัน มะม่วงฟ้าลั่น มะขาม มะขามหวาน มะขามเปรี้ยว',
+    'พุทรา กล้วย กล้วยน้ำว้า กล้วยหอม กล้วยไข่ มะละกอ ฝรั่ง ส้ม ส้มเขียวหวาน ส้มโอ สับปะรด แตงโม แคนตาลูป',
+    'ทุเรียน มังคุด เงาะ ลำไย ลิ้นจี่ ลองกอง ลางสาด ละมุด ชมพู่ น้อยหน่า มะพร้าว มะพร้าวน้ำหอม มะยม มะดัน',
+    'กระท้อน มะเฟือง องุ่น แก้วมังกร ขนุน มะขามป้อม ตะลิงปลิง มะปราง มะม่วงหาวมะนาวโห่ สตรอว์เบอร์รี่ อะโวคาโด',
+    // ของแปรรูป ผลไม้แช่อิ่ม ขนม
+    'มะม่วงกวน มะม่วงแช่อิ่ม มะม่วงดอง มะม่วงอบแห้ง มะม่วงหยี มะขามแช่อิ่ม มะขามคลุก มะขามกวน มะขามจี๊ด',
+    'พุทราเชื่อม พุทราอบแห้ง พุทราแช่อิ่ม กล้วยตาก กล้วยฉาบ กล้วยกวน กล้วยอบเนย กล้วยเชื่อม ทุเรียนกวน ทุเรียนทอด',
+    'ขนุนอบแห้ง ขนุนทอด มะยมเชื่อม มะยมแช่อิ่ม มะดันแช่อิ่ม กระท้อนแช่อิ่ม สับปะรดกวน สับปะรดอบแห้ง',
+    'มะละกอแช่อิ่ม ส้มโอแช่อิ่ม เปลือกส้มโอเชื่อม มะพร้าวแก้ว มะพร้าวเผา ถั่วตัด งาตัด ข้าวแต๋น ทองม้วน ทองหยิบ',
+    'ทองหยอด ฝอยทอง ขนมเปี๊ยะ กระยาสารท ข้าวเหนียวมะม่วง ข้าวเหนียวมูน เผือกเชื่อม มันเชื่อม ฟักทองเชื่อม',
+    'ลูกตาลเชื่อม สละลอยแก้ว เม็ดมะม่วงหิมพานต์ ถั่วลิสงคั่ว แยม แยมสับปะรด น้ำพริก น้ำพริกเผา พริกแกง',
+    'น้ำมะม่วง น้ำมะขาม น้ำกระเจี๊ยบ น้ำตะไคร้ น้ำลำไย น้ำส้ม น้ำมะพร้าว น้ำอัญชัน น้ำใบเตย',
+    // เครื่องปรุง วัตถุดิบ
+    'น้ำตาล น้ำตาลทราย น้ำตาลทรายแดง น้ำตาลปี๊บ น้ำตาลมะพร้าว น้ำตาลโตนด น้ำตาลกรวด เกลือ เกลือป่น',
+    'น้ำปลา ซีอิ๊ว ซีอิ๊วดำ ซอสปรุงรส ซอสหอยนางรม ซอสพริก ซอสมะเขือเทศ ผงชูรส ผงปรุงรส พริกป่น พริกแห้ง',
+    'พริกขี้หนู กระเทียม หอมแดง หอมใหญ่ มะนาว มะขามเปียก น้ำส้มสายชู กะทิ หัวกะทิ แป้งมัน แป้งท้าวยายม่อม',
+    'แป้งข้าวเหนียว แป้งข้าวเจ้า แป้งสาลี แป้งข้าวโพด น้ำมันพืช น้ำมันปาล์ม งา งาขาว งาดำ ถั่วลิสง ถั่วเขียว',
+    'กรดมะนาว สีผสมอาหาร กลิ่นวานิลลา ผงฟู เนย มาการีน นมข้นหวาน นมข้นจืด นมสด ไข่ไก่ ไข่เป็ด ใบเตย มะพร้าวขูด',
+    'ข้าวสาร ข้าวเหนียว ตะไคร้ ข่า ใบมะกรูด อบเชย โป๊ยกั้ก พริกไทย ยีสต์ วุ้นผง เจลาติน น้ำผึ้ง น้ำแข็ง',
+    // ผัก เครื่องดื่ม (ใส่ไว้กันถูกเดาเป็นคำอื่น)
+    'มะเขือเทศ แตงกวา ผักชี ต้นหอม คะน้า ผักบุ้ง กะหล่ำปลี ถั่วฝักยาว ฟักทอง เผือก มันเทศ มันสำปะหลัง ข้าวโพด',
+    'น้ำเปล่า น้ำดื่ม โซดา กาแฟ ชา ชาเย็น โอเลี้ยง น้ำอัดลม',
+    // แพคเกจจิ้ง
+    'ถุงร้อน ถุงเย็น ถุงหูหิ้ว ถุงซิป ถุงซิปล็อค ถุงสุญญากาศ ถุงฟอยล์ ถุงคราฟท์ ถุงกระดาษ ถุงแก้ว ถุงขยะ',
+    'กล่องโฟม กล่องข้าว กล่องพลาสติก กล่องกระดาษ กล่องเบเกอรี่ กล่องใส ถาดโฟม ถาดพลาสติก ถ้วยพลาสติก',
+    'กระปุกพลาสติก กระปุกแก้ว ขวดพลาสติก ขวดแก้ว ขวดเพท ฝาขวด แก้วพลาสติก ฝาแก้ว ฝาโดม หลอด ช้อนพลาสติก ส้อมพลาสติก',
+    'ยางวง หนังยาง เชือกฟาง ลวดมัดถุง ลวดเย็บ ฟิล์มยืด ฟิล์มถนอมอาหาร เทปกาว สก๊อตเทป สติกเกอร์ ฉลาก กระดาษไข',
+    'กระดาษห่อ ใบตอง ไม้เสียบ ไม้จิ้มฟัน ทิชชู่ ถุงมือ ถุงมือพลาสติก หมวกคลุมผม แก๊ส ถ่าน'
+  ].join(' ').split(/\s+/).filter(Boolean);
+  var DICT_SUGGEST = 0.7;
+
+  /** catalog: [{name, aliases[], unit}], products: ชื่อที่เคยบันทึก, dict: พจนานุกรม (ถามอย่างเดียว) */
+  function build(catalog, products, dict) {
+    var idx = { exact: {}, alias: {}, aliasSound: {}, targets: [], dictExact: {}, dictSound: {}, dictTargets: [] };
     function addTarget(name, key) {
       var s = sound(key);
       if (s.length >= 3) idx.targets.push({ name: name, s: s });
     }
+    (dict || DICT).forEach(function (w) {
+      var s = sound(w);
+      idx.dictExact[squash(w)] = w;
+      if (!(s in idx.dictSound)) idx.dictSound[s] = w;
+      if (s.length >= 3) idx.dictTargets.push({ name: w, s: s });
+    });
     (catalog || []).forEach(function (c) {
       idx.exact[squash(c.name)] = c.name;
       addTarget(c.name, c.name);
@@ -683,31 +734,56 @@ var Matcher = (function () {
     return idx;
   }
 
-  /** → null | {name, kind: 'exact'|'alias'|'auto'|'suggest', score} */
+  var SIZE_RE = /\s*\d+(?:\.\d+)?x\d+(?:\.\d+)?(?:\s*นิ้ว)?\s*/;
+
+  /** → null | {name, kind: 'exact'|'alias'|'auto'|'suggest', score} — ขนาด เช่น "6x9" ติดไปกับชื่อเสมอ */
   function match(heard, idx) {
+    var size = String(heard || '').match(SIZE_RE);
+    if (!size) return matchName(heard, idx);
+    var base = String(heard).replace(SIZE_RE, ' ').trim();
+    var m = base && matchName(base, idx);
+    if (!m) return null;
+    var full = m.name + ' ' + size[0].trim();
+    if (m.kind === 'exact' && squash(full) === squash(heard)) return { name: full, kind: 'exact', score: 1 };
+    return { name: full, kind: m.kind, score: m.score };
+  }
+
+  function matchName(heard, idx) {
     var q = squash(heard);
     if (!q || !idx) return null;
     if (idx.exact[q]) return { name: idx.exact[q], kind: 'exact', score: 1 };
     if (idx.alias[q]) return { name: idx.alias[q], kind: 'alias', score: 1 };
     var s = sound(heard);
     if (idx.aliasSound[s]) return { name: idx.aliasSound[s], kind: 'alias', score: 1 };
+    if (idx.dictExact[q]) return { name: idx.dictExact[q], kind: 'exact', score: 1 };
     if (s.length < 3) return null;
+
+    var r = rank(s, idx.targets);
+    if (r) {
+      if (r.top === 1) return { name: r.name, kind: 'alias', score: 1 };
+      if (r.top >= AUTO && r.top - r.second >= 0.08) return { name: r.name, kind: 'auto', score: r.top };
+      if (r.top >= SUGGEST) return { name: r.name, kind: 'suggest', score: r.top };
+    }
+    // พจนานุกรม: เสียงเหมือนกันทุกตัว (ต่างแค่วรรณยุกต์) แก้ได้ ที่เหลือแค่ถาม
+    if (idx.dictSound[s]) return { name: idx.dictSound[s], kind: 'auto', score: 1 };
+    var d = rank(s, idx.dictTargets);
+    if (d && d.top >= DICT_SUGGEST) return { name: d.name, kind: 'suggest', score: d.top };
+    return null;
+  }
+
+  function rank(s, targets) {
     var best = {}, order = [];
-    idx.targets.forEach(function (t) {
+    targets.forEach(function (t) {
       var v = sim(s, t.s);
       if (!(t.name in best)) order.push(t.name);
       if (!(best[t.name] >= v)) best[t.name] = v;
     });
-    order.sort(function (a, b) { return best[b] - best[a]; });
     if (!order.length) return null;
-    var top = best[order[0]], second = order.length > 1 ? best[order[1]] : 0;
-    if (top === 1) return { name: order[0], kind: 'alias', score: 1 };
-    if (top >= AUTO && top - second >= 0.08) return { name: order[0], kind: 'auto', score: top };
-    if (top >= SUGGEST) return { name: order[0], kind: 'suggest', score: top };
-    return null;
+    order.sort(function (a, b) { return best[b] - best[a]; });
+    return { name: order[0], top: best[order[0]], second: order.length > 1 ? best[order[1]] : 0 };
   }
 
-  return { build: build, match: match, sound: sound, sim: sim, squash: squash };
+  return { build: build, match: match, sound: sound, sim: sim, squash: squash, dict: DICT };
 })();
 /*PARSER_END*/
 </script>
@@ -1034,7 +1110,7 @@ var Matcher = (function () {
 
   function fillDatalists() {
     var names = S.catalog.map(function (c) { return c.name; });
-    S.products.forEach(function (p) { if (names.indexOf(p) < 0) names.push(p); });
+    S.products.concat(Matcher.dict).forEach(function (p) { if (names.indexOf(p) < 0) names.push(p); });
     $('#dl-products').innerHTML = names.map(function (p) { return '<option value="' + esc(p) + '">'; }).join('');
     var units = Object.keys(Parser.units).map(function (k) { return Parser.units[k]; })
       .filter(function (u, i, a) { return a.indexOf(u) === i; });
