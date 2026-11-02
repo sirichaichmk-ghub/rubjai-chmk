@@ -414,7 +414,7 @@
  * - ถ้าเปิดแอปผ่านลิงก์ /exec โดยตรง ไม่ต้องใส่ (ใช้ google.script.run อัตโนมัติ)
  * - ถ้าวางไฟล์นี้บน GitHub Pages ต้องใส่ลิงก์ /exec ตรงนี้ */
 var API_URL = 'https://script.google.com/macros/s/AKfycbyc7kcSNMrcbyWec81A5PKhkLf38bOmxAiYIatgmNgI1t0RAu7sSLAASlOdk0yleCUn3g/exec';
-var APP_VERSION = 3;
+var APP_VERSION = 4;
 </script>
 
 <script>
@@ -959,7 +959,7 @@ var Matcher = (function () {
   function closeEl(id) { $(id).classList.remove('on'); }
 
   // ───────────── เข้าสู่ระบบ ─────────────
-  var pinName = '', pinVal = '';
+  var pinName = '', pinVal = '', pinUsers = [], loggingIn = false;
 
   function showLogin(msg) {
     showView('login');
@@ -972,6 +972,7 @@ var Matcher = (function () {
         $('#user-grid').innerHTML = '<div class="empty">ยังไม่มีผู้ใช้ — ให้ผู้ดูแลเพิ่มชื่อในแท็บ "ผู้ใช้" ของ Google Sheet</div>';
         return;
       }
+      pinUsers = res.pinUsers || res.users; // เซิร์ฟเวอร์รุ่นเก่าไม่ส่งมา = ทุกคนใส่ PIN
       $('#user-grid').innerHTML = res.users.map(function (n) {
         return '<button class="user-tile" data-name="' + esc(n) + '">' + esc(n) + '</button>';
       }).join('');
@@ -983,13 +984,36 @@ var Matcher = (function () {
   }
   function loginMsg(m) { $('#login-msg').hidden = !m; $('#login-msg').textContent = m; }
 
-  function pickUser(name) {
+  function pickUser(name, tile) {
+    if (loggingIn) return;
+    if (pinUsers.indexOf(name) < 0) {
+      // ไม่ได้ตั้ง PIN ไว้ในชีท → แตะชื่อแล้วเข้าเลย
+      if (tile) tile.textContent = 'กำลังเข้า...';
+      doLogin({ name: name, pin: '' }, function (e) {
+        if (tile) tile.textContent = name;
+        if (e.code === 'AUTH' && /PIN/.test(e.message)) { pinUsers.push(name); pickUser(name); }
+        else loginMsg(e.message);
+      });
+      return;
+    }
     pinName = name; pinVal = '';
     $('#pin-name').textContent = name;
     $('#login-pick').hidden = true;
     $('#login-pin').hidden = false;
     loginMsg('');
     drawPin();
+  }
+
+  function doLogin(auth, onError) {
+    loggingIn = true;
+    call('apiLogin', auth).then(function () {
+      loggingIn = false;
+      S.auth = auth; store.set('auth', auth);
+      startHome();
+    }).catch(function (e) {
+      loggingIn = false;
+      onError(e);
+    });
   }
   function drawPin() {
     $$('#pin-dots span').forEach(function (s, i) { s.classList.toggle('on', i < pinVal.length); });
@@ -999,11 +1023,7 @@ var Matcher = (function () {
     if (pinVal.length >= 4) return;
     pinVal += k; drawPin();
     if (pinVal.length === 4) {
-      var auth = { name: pinName, pin: pinVal };
-      call('apiLogin', auth).then(function () {
-        S.auth = auth; store.set('auth', auth);
-        startHome();
-      }).catch(function (e) {
+      doLogin({ name: pinName, pin: pinVal }, function (e) {
         vibrate([80, 60, 80]);
         pinVal = ''; drawPin();
         loginMsg(e.message);
@@ -1643,7 +1663,7 @@ var Matcher = (function () {
       return '<button data-k="' + k + '">' + (k === 'del' ? '⌫' : k) + '</button>';
     }).join('');
     $('#keypad').onclick = function (e) { var b = e.target.closest('button'); if (b) pinKey(b.dataset.k); };
-    $('#user-grid').onclick = function (e) { var b = e.target.closest('[data-name]'); if (b) pickUser(b.dataset.name); };
+    $('#user-grid').onclick = function (e) { var b = e.target.closest('[data-name]'); if (b) pickUser(b.dataset.name, b); };
     $('#pin-back').onclick = function () { $('#login-pick').hidden = false; $('#login-pin').hidden = true; loginMsg(''); };
 
     $('#mic-sale').onclick = function () { startEntry('ขาย'); };
@@ -1795,7 +1815,7 @@ var Matcher = (function () {
   var Mock = (function () {
     var t = today();
     var db = {
-      users: [{ name: 'คนที่ 1', pin: '1111' }, { name: 'คนที่ 2', pin: '2222' }, { name: 'คนที่ 3', pin: '3333' }],
+      users: [{ name: 'คนที่ 1', pin: '' }, { name: 'คนที่ 2', pin: '' }, { name: 'คนที่ 3', pin: '3333' }],
       markets: ['ตลาดนัดวัดใหม่', 'ตลาดเช้าหน้าอำเภอ'],
       catalog: [{ name: 'พุทราเชื่อม', aliases: [], unit: 'ถุง' }, { name: 'มะม่วงกวน', aliases: [], unit: 'กิโล' }],
       dayMarket: {},
@@ -1811,11 +1831,14 @@ var Matcher = (function () {
     function auth(a) {
       var u = db.users.filter(function (x) { return a && x.name === a.name; })[0];
       if (!u) fail('AUTH', 'ไม่พบชื่อนี้');
-      if (u.pin !== a.pin) fail('AUTH', 'PIN ไม่ถูกต้อง');
+      if (u.pin && u.pin !== a.pin) fail('AUTH', 'PIN ไม่ถูกต้อง');
       return u.name;
     }
     var fns = {
-      apiUsers: function () { return { ok: true, users: db.users.map(function (u) { return u.name; }) }; },
+      apiUsers: function () {
+        return { ok: true, users: db.users.map(function (u) { return u.name; }),
+          pinUsers: db.users.filter(function (u) { return u.pin; }).map(function (u) { return u.name; }) };
+      },
       apiLogin: function (a) { return { ok: true, me: auth(a) }; },
       apiInit: function (a, date) {
         var m = auth(a);
