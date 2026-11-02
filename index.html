@@ -117,6 +117,8 @@
   .badge { display: inline-block; font-size: 14px; font-weight: 800; padding: 1px 8px; border-radius: 8px; vertical-align: 2px; }
   .badge.sale { background: var(--sale-bg); color: var(--sale); }
   .badge.buy { background: var(--buy-bg); color: var(--buy); }
+  .suggest { margin-top: 6px; padding: 8px 10px; border-radius: 12px; background: #eef3ff; color: #1e3a8a; font-size: 18px; }
+  .yes-btn { margin-left: 6px; min-height: 44px; padding: 0 18px; border-radius: 10px; background: var(--accent); color: #fff; font-weight: 800; }
   .x-btn { width: 48px; height: 48px; border-radius: 12px; font-size: 22px; color: var(--muted); flex: none; }
   .empty { padding: 26px 10px; text-align: center; color: var(--muted); border: 2px dashed var(--line); border-radius: 16px; }
   .skel { height: 72px; border-radius: 16px; background: linear-gradient(90deg, #ebe8e0 25%, #f4f2ec 50%, #ebe8e0 75%); background-size: 200% 100%; animation: sh 1.2s infinite; }
@@ -412,7 +414,7 @@
  * - ถ้าเปิดแอปผ่านลิงก์ /exec โดยตรง ไม่ต้องใส่ (ใช้ google.script.run อัตโนมัติ)
  * - ถ้าวางไฟล์นี้บน GitHub Pages ต้องใส่ลิงก์ /exec ตรงนี้ */
 var API_URL = 'https://script.google.com/macros/s/AKfycbyc7kcSNMrcbyWec81A5PKhkLf38bOmxAiYIatgmNgI1t0RAu7sSLAASlOdk0yleCUn3g/exec';
-var APP_VERSION = 1;
+var APP_VERSION = 2;
 </script>
 
 <script>
@@ -618,6 +620,95 @@ var Parser = (function () {
 
   return { parse: parse, normalize: normalize, wordsToNumber: wordsToNumber, units: UNIT_MAP };
 })();
+
+/**
+ * เทียบชื่อสินค้าที่ได้ยินกับคลังคำ — ระบบฟังเสียงตั้งคำศัพท์ล่วงหน้าไม่ได้ จึงแก้หลังได้ยินแทน
+ * 1) ตรงกับชื่อ/คำที่เคยได้ยินผิด (alias) → ใช้ชื่อที่ถูกทันที
+ * 2) เสียงคล้ายมาก → แก้ให้เอง, คล้ายพอสมควร → ถามผู้ใช้ "หมายถึง ... ใช่ไหม?"
+ */
+var Matcher = (function () {
+  var AUTO = 0.86, SUGGEST = 0.6;
+  // พยัญชนะที่ออกเสียงคล้ายกัน (ระบบฟังเสียงมักสับสนกันเอง) → ตัวแทนเดียวกัน
+  var GROUPS = ['ขคฆก', 'ฉชฌจ', 'ซศษส', 'ญย', 'ดฎ', 'ตฏถทธฐฑฒ', 'นณ', 'ปผพภ', 'ฝฟ', 'รลฬ', 'หฮ', 'ไใ'];
+  var MAP = {};
+  GROUPS.forEach(function (g) { g.split('').forEach(function (c) { MAP[c] = g.charAt(0); }); });
+
+  function squash(s) { return String(s || '').replace(/\s+/g, ''); }
+
+  function sound(s) {
+    return squash(s)
+      .replace(/[ก-ฮ][ิุ]?์/g, '')        // ตัวการันต์ไม่ออกเสียง: "ห์" "ทร์"
+      .replace(/[่-๋็]/g, '')              // วรรณยุกต์ + ไม้ไต่คู้
+      .split('').map(function (c) { return MAP[c] || c; }).join('');
+  }
+
+  function lev(a, b) {
+    if (a === b) return 0;
+    var prev = [], cur, i, j;
+    for (j = 0; j <= b.length; j++) prev[j] = j;
+    for (i = 1; i <= a.length; i++) {
+      cur = [i];
+      for (j = 1; j <= b.length; j++) {
+        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a.charAt(i - 1) === b.charAt(j - 1) ? 0 : 1));
+      }
+      prev = cur;
+    }
+    return prev[b.length];
+  }
+
+  function sim(a, b) {
+    var n = Math.max(a.length, b.length);
+    return n ? 1 - lev(a, b) / n : 0;
+  }
+
+  /** catalog: [{name, aliases[], unit}], products: ชื่อที่เคยบันทึก */
+  function build(catalog, products) {
+    var idx = { exact: {}, alias: {}, aliasSound: {}, targets: [] };
+    function addTarget(name, key) {
+      var s = sound(key);
+      if (s.length >= 3) idx.targets.push({ name: name, s: s });
+    }
+    (catalog || []).forEach(function (c) {
+      idx.exact[squash(c.name)] = c.name;
+      addTarget(c.name, c.name);
+      (c.aliases || []).forEach(function (a) {
+        idx.alias[squash(a)] = c.name;
+        idx.aliasSound[sound(a)] = c.name;
+        addTarget(c.name, a);
+      });
+    });
+    (products || []).forEach(function (p) {
+      if (!idx.exact[squash(p)]) { idx.exact[squash(p)] = p; addTarget(p, p); }
+    });
+    return idx;
+  }
+
+  /** → null | {name, kind: 'exact'|'alias'|'auto'|'suggest', score} */
+  function match(heard, idx) {
+    var q = squash(heard);
+    if (!q || !idx) return null;
+    if (idx.exact[q]) return { name: idx.exact[q], kind: 'exact', score: 1 };
+    if (idx.alias[q]) return { name: idx.alias[q], kind: 'alias', score: 1 };
+    var s = sound(heard);
+    if (idx.aliasSound[s]) return { name: idx.aliasSound[s], kind: 'alias', score: 1 };
+    if (s.length < 3) return null;
+    var best = {}, order = [];
+    idx.targets.forEach(function (t) {
+      var v = sim(s, t.s);
+      if (!(t.name in best)) order.push(t.name);
+      if (!(best[t.name] >= v)) best[t.name] = v;
+    });
+    order.sort(function (a, b) { return best[b] - best[a]; });
+    if (!order.length) return null;
+    var top = best[order[0]], second = order.length > 1 ? best[order[1]] : 0;
+    if (top === 1) return { name: order[0], kind: 'alias', score: 1 };
+    if (top >= AUTO && top - second >= 0.08) return { name: order[0], kind: 'auto', score: top };
+    if (top >= SUGGEST) return { name: order[0], kind: 'suggest', score: top };
+    return null;
+  }
+
+  return { build: build, match: match, sound: sound, sim: sim, squash: squash };
+})();
 /*PARSER_END*/
 </script>
 
@@ -733,6 +824,7 @@ var Parser = (function () {
     dayMarketSet: false,
     prices: {},
     products: [],
+    catalog: [],
     loaded: false,
     loadError: '',
     draft: [],
@@ -859,7 +951,8 @@ var Parser = (function () {
       if (date !== S.date) return;
       S.items = res.items; S.users = res.users; S.markets = res.markets;
       S.dayMarket = res.dayMarket; S.dayMarketSet = res.dayMarketSet;
-      S.prices = res.prices; S.products = res.products;
+      S.prices = res.prices; S.products = res.products; S.catalog = res.catalog || [];
+      matchIdx = null;
       S.loaded = true; S.loadError = '';
       fillDatalists();
       renderHome();
@@ -940,7 +1033,9 @@ var Parser = (function () {
   }
 
   function fillDatalists() {
-    $('#dl-products').innerHTML = S.products.map(function (p) { return '<option value="' + esc(p) + '">'; }).join('');
+    var names = S.catalog.map(function (c) { return c.name; });
+    S.products.forEach(function (p) { if (names.indexOf(p) < 0) names.push(p); });
+    $('#dl-products').innerHTML = names.map(function (p) { return '<option value="' + esc(p) + '">'; }).join('');
     var units = Object.keys(Parser.units).map(function (k) { return Parser.units[k]; })
       .filter(function (u, i, a) { return a.indexOf(u) === i; });
     $('#dl-units').innerHTML = units.map(function (u) { return '<option value="' + esc(u) + '">'; }).join('');
@@ -996,7 +1091,7 @@ var Parser = (function () {
 
   var rec = null;
   function listen() {
-    var finalText = '', interim = '', err = '', cancelled = false;
+    var finals = [], interim = '', err = '', cancelled = false;
     $('#ls-pulse').className = 'pulse ' + (S.draftType === 'ขาย' ? 'sale' : 'buy');
     $('#ls-title').textContent = 'กำลังฟัง... พูดได้เลย';
     $('#ls-live').textContent = '';
@@ -1006,7 +1101,7 @@ var Parser = (function () {
       rec.lang = 'th-TH';
       rec.interimResults = true;
       rec.continuous = false;
-      rec.maxAlternatives = 1;
+      rec.maxAlternatives = 5;
     } catch (e) {
       closeEl('#ov-listen');
       speechBlocked = true; openConfirm();
@@ -1015,17 +1110,31 @@ var Parser = (function () {
     rec.onresult = function (e) {
       interim = '';
       for (var i = e.resultIndex; i < e.results.length; i++) {
-        var t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) finalText += t + ' '; else interim += t;
+        var r = e.results[i];
+        if (r.isFinal) {
+          var alts = [];
+          for (var k = 0; k < r.length; k++) if (r[k].transcript) alts.push(r[k].transcript);
+          finals.push(alts.length ? alts : ['']);
+        } else {
+          interim += r[0].transcript;
+        }
       }
-      $('#ls-live').textContent = (finalText + interim).trim();
+      $('#ls-live').textContent = (finals.map(function (a) { return a[0]; }).join(' ') + ' ' + interim).trim();
     };
     rec.onerror = function (e) { err = e.error || ''; };
     rec.onend = function () {
       rec = null;
       closeEl('#ov-listen');
       if (cancelled) { if (!S.draft.length) closeEl('#ov-confirm'); return; }
-      var text = (finalText + ' ' + interim).trim();
+      var text = interim.trim();
+      if (finals.length) {
+        var maxK = Math.max.apply(null, finals.map(function (a) { return a.length; }));
+        var cands = [];
+        for (var k = 0; k < maxK; k++) {
+          cands.push(finals.map(function (a) { return a[Math.min(k, a.length - 1)]; }).join(' ').trim());
+        }
+        text = (pickBestTranscript(cands) + ' ' + interim).trim();
+      }
       if (text) { addFromText(text); return; }
       if (err === 'not-allowed' || err === 'service-not-allowed' || err === 'audio-capture') {
         speechBlocked = true; store.set('speechBlocked', true);
@@ -1043,12 +1152,55 @@ var Parser = (function () {
     try { rec.start(); } catch (e) { closeEl('#ov-listen'); toast('เปิดไมค์ไม่ได้ ลองอีกครั้ง'); }
   }
 
-  /** ใช้ชื่อสินค้าที่เคยบันทึก + เติมราคาเดิมเมื่อไม่ได้พูดราคา */
+  var matchIdx = null;
+  function matchIndex() {
+    if (!matchIdx) matchIdx = Matcher.build(S.catalog, S.products);
+    return matchIdx;
+  }
+
+  /** แก้ชื่อตามคลังคำ + เติมราคาเดิมเมื่อไม่ได้พูดราคา */
   function enrich(it) {
-    var key = noSpace(it.name);
-    for (var i = 0; i < S.products.length; i++) {
-      if (noSpace(S.products[i]) === key) { it.name = S.products[i]; break; }
-    }
+    it.heard = it.name;
+    var m = Matcher.match(it.name, matchIndex());
+    if (m && m.kind === 'exact') it.name = m.name;
+    else if (m && (m.kind === 'alias' || m.kind === 'auto')) { it.name = m.name; it.fixed = true; }
+    else if (m && m.kind === 'suggest') it.suggest = m.name;
+    return applyPrice(it);
+  }
+
+  /** ในหลายคำที่ระบบฟังเสียงเสนอมา เลือกคำที่ชื่อสินค้าตรงกับคลังคำมากที่สุด */
+  function pickBestTranscript(cands) {
+    var best = cands[0], bestScore = -1;
+    cands.forEach(function (t) {
+      var score = 0;
+      Parser.parse(t, S.draftType).items.forEach(function (it) {
+        var m = Matcher.match(it.name, matchIndex());
+        if (!m) return;
+        score += m.kind === 'suggest' ? m.score : m.kind === 'auto' ? 1.5 : 2;
+      });
+      if (score > bestScore) { best = t; bestScore = score; }
+    });
+    return best;
+  }
+
+  /** จำคำที่ได้ยินผิด → ชื่อที่ถูก (ส่งขึ้นแท็บคลังสินค้า, ไม่รอผล) */
+  function learnAliases(items) {
+    var pairs = items.filter(function (d) {
+      return d.heard && d.name && noSpace(d.heard) !== noSpace(d.name);
+    }).map(function (d) { return { heard: d.heard, name: d.name, unit: d.unit || '' }; });
+    if (!pairs.length) return;
+    pairs.forEach(function (p) {
+      var c = S.catalog.filter(function (x) { return noSpace(x.name) === noSpace(p.name); })[0];
+      if (!c) S.catalog.push({ name: p.name, aliases: [p.heard], unit: p.unit });
+      else if (c.aliases.indexOf(p.heard) < 0) c.aliases.push(p.heard);
+    });
+    matchIdx = null;
+    call('apiLearnAliases', S.auth, pairs).then(function (res) {
+      if (res.catalog) { S.catalog = res.catalog; matchIdx = null; }
+    }).catch(function () { /* ไม่กระทบการบันทึก — ครั้งหน้าค่อยจำใหม่ */ });
+  }
+
+  function applyPrice(it) {
     var mem = S.prices[it.type + '|' + it.name];
     if (it.amount == null && mem && mem.unitPrice) {
       if (it.qty == null) { it.qty = 1; it.unit = mem.unit || ''; }
@@ -1099,10 +1251,15 @@ var Parser = (function () {
         if (d.qty != null) sub.push(fmt(d.qty) + ' ' + esc(d.unit || ''));
         if (d.qty && d.amount) sub.push('(' + fmt(round2(d.amount / d.qty)) + '/' + esc(d.unit || 'หน่วย') + ')');
         if (d.fromMemory) sub.push('ใช้ราคาเดิม');
+        var heardNote = d.fixed && d.heard ? '<div class="sub">🔁 ได้ยินว่า “' + esc(d.heard) + '”</div>' : '';
+        var suggest = d.suggest
+          ? '<div class="suggest">หมายถึง <b>' + esc(d.suggest) + '</b> ใช่ไหม? ' +
+            '<button class="yes-btn" data-accept="' + d.key + '">ใช่</button></div>'
+          : '';
         return '<div class="row ' + cls + (prob ? ' bad' : '') + '" data-key="' + d.key + '" role="button" tabindex="0">' +
           '<div class="main"><div class="name"><span class="badge ' + cls + '">' + (d.type === 'ขาย' ? 'ขาย' : 'ซื้อ') + '</span> ' +
           esc(d.name || '—') + '</div>' +
-          (sub.length ? '<div class="sub">' + sub.join(' ') + '</div>' : '') +
+          (sub.length ? '<div class="sub">' + sub.join(' ') + '</div>' : '') + heardNote + suggest +
           (prob ? '<div class="warn">⚠️ ' + prob + '</div>' : '') + '</div>' +
           '<div class="amt">' + (d.amount != null ? fmt(d.amount) : '?') + '</div>' +
           '<button class="x-btn" data-del="' + d.key + '" aria-label="ลบ">✕</button></div>';
@@ -1140,6 +1297,7 @@ var Parser = (function () {
       if (S.products.indexOf(x.name) < 0) S.products.unshift(x.name);
     });
     Outbox.add(items);
+    learnAliases(S.draft);
     var sale = 0, buy = 0;
     items.forEach(function (x) { if (x.type === 'ขาย') sale += x.amount; else buy += x.amount; });
     S.draft = []; S.said = [];
@@ -1209,7 +1367,9 @@ var Parser = (function () {
     if (!f) return;
     if (editing.mode === 'draft') {
       S.draft = S.draft.map(function (d) {
-        return d.key === editing.key ? Object.assign({}, d, f, { fromMemory: false }) : d;
+        if (d.key !== editing.key) return d;
+        var renamed = noSpace(f.name) !== noSpace(d.name);
+        return Object.assign({}, d, f, { fromMemory: false, suggest: null, fixed: renamed ? false : d.fixed });
       });
       closeEl('#sh-edit'); renderConfirm();
       return;
@@ -1467,6 +1627,16 @@ var Parser = (function () {
     };
     $('#cf-save').onclick = saveDraft;
     $('#cf-list').onclick = function (e) {
+      var acc = e.target.closest('[data-accept]');
+      if (acc) {
+        S.draft = S.draft.map(function (d) {
+          if (d.key !== acc.dataset.accept) return d;
+          var n = Object.assign({}, d, { name: d.suggest, suggest: null, fixed: true });
+          return n.amount == null ? applyPrice(n) : n;
+        });
+        renderConfirm();
+        return;
+      }
       var del = e.target.closest('[data-del]');
       if (del) {
         S.draft = S.draft.filter(function (d) { return d.key !== del.dataset.del; });
@@ -1551,6 +1721,7 @@ var Parser = (function () {
     var db = {
       users: [{ name: 'คนที่ 1', pin: '1111' }, { name: 'คนที่ 2', pin: '2222' }, { name: 'คนที่ 3', pin: '3333' }],
       markets: ['ตลาดนัดวัดใหม่', 'ตลาดเช้าหน้าอำเภอ'],
+      catalog: [{ name: 'พุทราเชื่อม', aliases: [], unit: 'ถุง' }, { name: 'มะม่วงกวน', aliases: [], unit: 'กิโล' }],
       dayMarket: {},
       tx: [
         { id: 'Tmock1', date: t, time: '07:10', user: 'คนที่ 1', type: 'ขาย', market: 'ตลาดนัดวัดใหม่', name: 'มะม่วงกวน', qty: 2, unit: 'กิโล', unitPrice: 120, amount: 240 },
@@ -1578,7 +1749,16 @@ var Parser = (function () {
         return { ok: true, me: m, items: db.tx.filter(function (x) { return x.date === date; }),
           users: db.users.map(function (u) { return u.name; }), markets: db.markets.slice(),
           dayMarket: db.dayMarket[k] || '', dayMarketSet: k in db.dayMarket, prices: prices,
-          products: Object.keys(counts) };
+          products: Object.keys(counts), catalog: JSON.parse(JSON.stringify(db.catalog)) };
+      },
+      apiLearnAliases: function (a, pairs) {
+        auth(a);
+        pairs.forEach(function (p) {
+          var c = db.catalog.filter(function (x) { return x.name === p.name; })[0];
+          if (!c) db.catalog.push({ name: p.name, aliases: [p.heard], unit: p.unit });
+          else if (c.aliases.indexOf(p.heard) < 0) c.aliases.push(p.heard);
+        });
+        return { ok: true, learned: pairs.length, catalog: JSON.parse(JSON.stringify(db.catalog)) };
       },
       apiItems: function (a, f, to) { auth(a); return { ok: true, items: db.tx.filter(function (x) { return x.date >= f && x.date <= to; }) }; },
       apiSetMarket: function (a, d, m) {
